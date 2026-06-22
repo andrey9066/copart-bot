@@ -3,9 +3,9 @@ import json
 import asyncio
 import logging
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
-from playwright.async_api import async_playwright
+from curl_cffi import requests
 from telegram import Bot
 from telegram.constants import ParseMode
 
@@ -14,24 +14,8 @@ log = logging.getLogger("copart-bot")
 
 DATA_DIR = Path(__file__).parent / "data"
 SEEN_FILE = DATA_DIR / "seen_listings.json"
-COOKIES_FILE = DATA_DIR / "cookies.json"
 
 COPART_BASE = "https://www.copart.com/lot/"
-COPART_SEARCH = "https://www.copart.com/public/lots/search-results"
-
-STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-delete navigator.__proto__.webdriver;
-window.chrome = { runtime: {}, csi: function(){}, loadTimes: function(){} };
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications' ?
-    Promise.resolve({ state: Notification.permission }) :
-    originalQuery(parameters)
-);
-"""
 
 SEARCH_PAYLOAD = {
     "query": ["alfa romeo giulia"],
@@ -70,7 +54,7 @@ def save_seen(seen: dict):
     SEEN_FILE.write_text(json.dumps(seen, indent=2), encoding="utf-8")
 
 
-def parse_auction_date(ts_ms: int, tz_str: str) -> str:
+def parse_auction_date(ts_ms: int) -> str:
     if not ts_ms:
         return "N/A"
     try:
@@ -94,17 +78,14 @@ def format_listing(item: dict) -> str:
     transmission = item.get("tmtp", "")
     drive = item.get("drv", "")
     title = item.get("tgd", "")
-    state = item.get("ts", "")
     yard = item.get("yn", "")
     auction_ts = item.get("ad", "")
-    auction_tz = item.get("tz", "")
     currency = item.get("cuc", "USD")
     current_bid = item.get("dynamicLotDetails", {}).get("currentBid", 0)
     image_url = item.get("tims", "")
     hot_flags = item.get("lfd", [])
-    tags = item.get("lic", [])
 
-    auction_date = parse_auction_date(auction_ts, auction_tz)
+    auction_date = parse_auction_date(auction_ts)
 
     parts = [f"*{year} {make} {model}*"]
     if color:
@@ -138,80 +119,65 @@ def format_listing(item: dict) -> str:
     return "\n".join(parts)
 
 
-async def fetch_listings_via_browser():
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--window-size=1920,1080",
-            ],
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-        )
-        page = await context.new_page()
-        await page.add_init_script(STEALTH_JS)
+def fetch_listings() -> list:
+    session = requests.Session(impersonate="chrome131")
 
-        log.info("Loading Copart homepage...")
-        await page.goto("https://www.copart.com/", wait_until="domcontentloaded", timeout=60000)
-        for i in range(20):
-            await asyncio.sleep(2)
-            t = await page.title()
-            if "copart" in t.lower() or "auction" in t.lower():
-                log.info("Homepage loaded")
-                break
+    log.info("Visiting Copart homepage...")
+    try:
+        session.get("https://www.copart.com/", timeout=20)
+    except Exception as e:
+        log.error("Failed to load homepage: %s", e)
+        return []
 
-        await asyncio.sleep(2)
+    all_listings = []
+    page_num = 0
+    page_size = 24
 
-        all_listings = []
-        page_num = 0
-        page_size = 24
+    while True:
+        payload = dict(SEARCH_PAYLOAD)
+        payload["page"] = page_num
+        payload["start"] = page_num * page_size
 
-        while True:
-            payload = dict(SEARCH_PAYLOAD)
-            payload["page"] = page_num
-            payload["start"] = page_num * page_size
+        log.info("Fetching page %d...", page_num)
+        try:
+            resp = session.post(
+                "https://www.copart.com/public/lots/search-results",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": "https://www.copart.com",
+                    "Referer": "https://www.copart.com/searchResults/",
+                },
+                timeout=20,
+            )
+            data = resp.json()
+        except Exception as e:
+            log.error("API request failed: %s", e)
+            break
 
-            log.info("Fetching page %d...", page_num)
-            result = await page.evaluate("""async (payload) => {
-                const resp = await fetch('/public/lots/search-results', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'},
-                    body: JSON.stringify(payload),
-                });
-                return await resp.json();
-            }""", payload)
+        content = data.get("data", {}).get("results", {}).get("content", [])
+        total = data.get("data", {}).get("results", {}).get("totalElements", 0)
 
-            content = result.get("data", {}).get("results", {}).get("content", [])
-            total = result.get("data", {}).get("results", {}).get("totalElements", 0)
+        if not content:
+            break
 
-            if not content:
-                break
+        all_listings.extend(content)
+        log.info("Got %d items (total so far: %d/%d)", len(content), len(all_listings), total)
 
-            all_listings.extend(content)
-            log.info("Got %d items (total so far: %d/%d)", len(content), len(all_listings), total)
+        if len(all_listings) >= total or len(content) < page_size:
+            break
 
-            if len(all_listings) >= total or len(content) < page_size:
-                break
+        page_num += 1
 
-            page_num += 1
-            await asyncio.sleep(1)
-
-        await browser.close()
-        return all_listings
+    return all_listings
 
 
 async def check_new_listings(bot: Bot, chat_id: str):
     seen = load_seen()
 
     try:
-        listings = await fetch_listings_via_browser()
+        listings = fetch_listings()
     except Exception as e:
         log.error("Failed to fetch listings: %s", e)
         return
@@ -252,7 +218,7 @@ async def check_new_listings(bot: Bot, chat_id: str):
             except Exception as e2:
                 log.error("Retry also failed: %s", e2)
 
-        seen[lot] = datetime.utcnow().isoformat()
+        seen[lot] = datetime.now(timezone.utc).isoformat()
         await asyncio.sleep(0.5)
 
     save_seen(seen)
